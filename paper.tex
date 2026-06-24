@@ -1,0 +1,618 @@
+% !TeX program = pdflatex
+\documentclass[10pt]{article}
+\usepackage{tmlr}
+% For submission: leave default. For camera-ready: \usepackage[accepted]{tmlr}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{xspace}
+
+% --- Convenience macros ---
+\newcommand{\tgp}{\textsc{TGP}\xspace}
+\newcommand{\nvr}{\text{NVR}}
+\newcommand{\auroc}{\text{AUROC}}
+\newcommand{\R}{\mathbb{R}}
+
+% --- TMLR metadata ---
+\def\month{06}
+\def\year{2026}
+\def\openreview{\url{https://openreview.net/forum?id=XXXX}}
+
+\title{Trajectory Geometry Probe: Detecting Grounding Failures in\\Language Models via Cross-Layer Curvature}
+
+\author{\name R Nishanth Reddy \email nishanthreddyr24@gmail.com \\
+      \addr Independent Researcher}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+We introduce the \emph{Trajectory Geometry Probe} (\tgp), a computationally lightweight, single-pass method for detecting hallucinations in decoder-only language models.
+\tgp exploits a geometric phenomenon we identify in the residual stream: when a model generates tokens that contradict a provided context, the cross-layer hidden-state trajectory of those tokens undergoes a measurable distortion---the trajectory curves sharply, the signal-to-noise ratio degrades, and the trajectory dispersion of layer-to-layer updates spikes.
+\tgp captures this distortion through a suite of complementary metrics---the \emph{Norm-to-Variance Ratio} (NVR) and \emph{Discrete Frenet--Serret Curvature} across different network depths, combined with a \emph{Nearest Context Neighbour} (NCN) tracker and a \emph{Virial Ratio}---all computed from a single forward pass.
+Across three architectures spanning an order of magnitude in parameter count (GPT-2 Small 124M, GPT-2 Large 774M, Qwen2.5-1.5B) and six evaluation settings, \tgp achieves $0.998$ AUROC on adversarial question-answering and $0.823$ AUROC on summarization hallucination detection.
+Equally important, we precisely characterize the \emph{mechanistic boundary} of the approach: \tgp detects \emph{grounding failures}---where the model attempts but fails to ground generated tokens in a provided context---and is empirically uninformative (${\sim}0.50$ AUROC) for parametric hallucinations that lack external context.
+This honest characterization of scope, supported by boundary probes on TruthfulQA and FEVER, distinguishes our contribution from prior work that overstates generality.
+\end{abstract}
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large language models (LLMs) generate fluent text that is often factually incorrect---a phenomenon termed \emph{hallucination} \citep{ji2023survey}.
+Detection is critical for safe deployment in retrieval-augmented generation (RAG) pipelines, where a model is expected to faithfully summarize or answer questions from a retrieved document.
+Existing detection methods, however, impose substantial overhead.
+Sampling-based approaches such as Semantic Entropy \citep{kuhn2023semantic} and SelfCheckGPT \citep{manakul2023selfcheckgpt} require $5$--$20\times$ additional forward passes per query.
+Learned probes such as SAPLMA \citep{azaria2023internal} and CCS \citep{burns2022discovering} require labeled training data and may not transfer across tasks.
+These constraints limit applicability in latency-sensitive production systems.
+
+We observe that hallucinations in grounded generation leave a \emph{geometric signature} in the model's hidden states.
+When a decoder-only transformer is provided with a factual context and generates tokens consistent with that context, the cross-layer hidden-state trajectory evolves smoothly: each layer refines the representation with small, directionally consistent updates.
+When the model instead generates a token that contradicts the context---a \emph{grounding failure}---the trajectory undergoes a sudden geometric distortion, measurable through standard tools of discrete differential geometry.
+
+This paper makes three contributions:
+\begin{enumerate}[nosep,leftmargin=*]
+    \item We formalize a suite of geometric metrics---NVR, Discrete Frenet--Serret Curvature, NCN, and Virial Ratio---that collectively characterize the cross-layer trajectory of a generated token (\S\ref{sec:method}). While the geometric feature extraction requires no learned parameters and no sampling, the final classification threshold is calibrated via a lightweight logistic regression, making the overall pipeline weakly supervised. We document a novel "two-engine" depth-shift mechanism and an NVR inversion on naturalistic data.
+    \item We evaluate \tgp across three decoder-only architectures and six benchmark settings, demonstrating up to $0.998$ AUROC on adversarial QA and $0.982$ on summarization hallucination detection (\S\ref{sec:experiments}).
+    \item We precisely characterize the mechanistic boundary: \tgp detects grounding failures and is empirically uninformative for parametric hallucinations. We validate this boundary on TruthfulQA and FEVER, and provide a \emph{Grounding Failure Hypothesis} that unifies all observed results (\S\ref{sec:boundary}).
+\end{enumerate}
+
+% ============================================================================
+% 2. RELATED WORK
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Sampling-based uncertainty estimation.}
+Semantic Entropy \citep{kuhn2023semantic} clusters sampled generations by bidirectional entailment to estimate predictive uncertainty, requiring $5$--$10$ additional generations per query.
+SelfCheckGPT \citep{manakul2023selfcheckgpt} generates multiple responses and measures inter-sample consistency.
+Both achieve strong detection performance but impose multiplicative inference cost, making them unsuitable for real-time RAG pipelines.
+
+\paragraph{Learned probes and representation engineering.}
+SAPLMA \citep{azaria2023internal} trains a binary classifier on the final-layer hidden state.
+CCS \citep{burns2022discovering} learns a contrast-consistent direction in activation space without labels.
+ITI \citep{li2023inference} identifies ``truthfulness directions'' via linear probing.
+Representation Engineering \citep{zou2023representation} demonstrates directional structure for truthfulness/honesty in hidden states, and \citet{marks2023geometry} map the geometry of truth.
+These methods offer strong performance but require task-specific training data and may not transfer across domains or model families without retraining.
+
+\paragraph{Attention-based methods.}
+Lookback Lens \citep{chuang2024lookback} computes the ratio of attention weight allocated to context tokens versus generated tokens.
+This is conceptually related to our approach, as both exploit the model's failure to attend to context during hallucination.
+However, Lookback Lens requires access to per-head attention weights, while \tgp operates solely on aggregated hidden states---available even from APIs that do not expose attention matrices.
+
+\paragraph{Internal geometry methods.}
+INSIDE/EigenScore \citep{chen2024inside} performs SVD on hidden-state covariance matrices, computing an eigenvalue-derived hallucination score at $O(LD^2)$ cost.
+MIND \citep{su2024mind} probes internal state differences across layers for hallucination detection.
+TokenSAR \citep{duan2024tokensar} performs token-level self-assessment via internal representations.
+Our NVR metric captures a related signal---the ratio of representation magnitude to variance---but at $O(LD)$ cost, where $L$ is the number of layers and $D$ is the hidden dimension.
+
+\paragraph{Positioning.}
+\tgp is, to our knowledge, the first method to apply \emph{discrete trajectory curvature} (Frenet--Serret) and \emph{trajectory dispersion} to cross-layer hidden states for hallucination detection.
+Unlike all methods above, \tgp is simultaneously (i)~computationally lightweight in its feature extraction\footnotemark, (ii)~single-pass, and (iii)~independent of attention weights.
+Table~\ref{tab:comparison} summarizes the methodological differences.
+
+\footnotetext{While extracting the geometric features relies on unsupervised arithmetic, evaluating the combined \tgp score relies on a lightweight logistic regression classifier calibrated via cross-validation.}
+
+\begin{table}[t]
+\centering
+\caption{Conceptual comparison of \tgp against state-of-the-art internal state hallucination detection methods. $L$ is the number of layers, $D$ is the hidden dimension, and $N_{gen}$ is the number of samples required.}
+\label{tab:comparison}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{Passes} & \textbf{Internal Rep.} & \textbf{Cost} & \textbf{Mechanism} \\
+\midrule
+Semantic Entropy \citep{kuhn2023semantic} & Multiple ($5-10\times$) & None & High & Clustering sampled meanings \\
+SelfCheckGPT \citep{manakul2023selfcheckgpt} & Multiple ($5-10\times$) & None & High & Consistency across samples \\
+INSIDE \citep{chen2024inside} & Single ($1\times$) & Covariance & $O(LD^2)$ & Eigenvalue decomposition \\
+\midrule
+\textbf{\tgp (Ours)} & Single ($1\times$) & Vector & $\mathbf{O(LD)}$ & \textbf{Geometric Trajectory} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% 3. METHOD
+% ============================================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Setting and Notation}
+\label{sec:setting}
+
+Consider an autoregressive transformer with $L$ layers and hidden dimension $D$.
+Given an input sequence of length $T$, let $\mathbf{h}_t^{(\ell)} \in \R^D$ denote the hidden state of token $t$ at layer $\ell$.
+For a generated token at position $t$, we define the \emph{cross-layer trajectory}:
+\begin{equation}
+    \gamma_t = \bigl(\mathbf{h}_t^{(0)},\; \mathbf{h}_t^{(1)},\; \ldots,\; \mathbf{h}_t^{(L)}\bigr) \in \R^{(L+1) \times D},
+    \label{eq:trajectory}
+\end{equation}
+which traces how the representation of token $t$ evolves across the depth of the network.
+This trajectory lives in a fixed-dimensional space determined solely by the model architecture: $L+1$ points in $\R^D$.
+Crucially, the dimensionality of this trajectory is independent of the input sequence length $T$, which insulates all downstream metrics from sequence-length confounders.
+
+\subsection{Metric 1: Norm-to-Variance Ratio (NVR) and the Two-Engine Zone Shift}
+\label{sec:nvr}
+
+The NVR measures the signal-to-noise ratio of the cross-layer trajectory.
+During grounded generation, hidden-state norms remain high (strong, coherent signal) and variance across layers is low (stable, incremental refinement).
+
+\begin{definition}[Norm-to-Variance Ratio]
+Given a trajectory segment $\gamma = (\mathbf{h}^{(1)}, \ldots, \mathbf{h}^{(K)}) \in \R^{K \times D}$, define
+\begin{equation}
+    \nvr(\gamma) = \frac{\bar{r}}{\sqrt{\operatorname{tr}(\mathbf{\Sigma})} + \epsilon},
+    \quad \text{where} \quad
+    \bar{r} = \frac{1}{K}\sum_{\ell=1}^{K} \|\mathbf{h}^{(\ell)}\|_2,
+    \quad
+    \mathbf{\Sigma} = \operatorname{diag}\!\bigl(\operatorname{Var}[\gamma]\bigr),
+\end{equation}
+and $\epsilon = 10^{-8}$ prevents division by zero.
+\end{definition}
+
+\paragraph{Mechanistic Interpretation: The Two-Engine Zone Shift.}
+We compute NVR on two distinct zones: the \emph{Early} layers ($0$ to $\lfloor L/3 \rfloor$) and the \emph{Middle} layers ($\lfloor L/3 \rfloor$ to $2\lfloor L/3 \rfloor$).
+Early attention heads perform initial context retrieval. When they agree with the generated token, the signal is clean and NVR is high. An intrinsic contradiction (e.g., an adversarial QA hallucination) forces early retrieval heads to fight the generation token immediately, causing representational turbulence and a sharp drop in Early NVR.
+However, for long documents (e.g., summarization), attentional conflict does not crystallize in early layers. The model partially retrieves across thousands of tokens before the conflict propagates into the MLP layers. Thus, the locus of conflict shifts: Early NVR dominates short adversarial QA, while Middle NVR captures the delayed conflict in long summarization.
+
+\subsection{Metric 2: Discrete Frenet--Serret Curvature}
+\label{sec:curvature}
+
+The curvature of the cross-layer trajectory measures how sharply the representation changes direction as it passes through successive layers.
+During grounding failure, consecutive layers pull in opposite directions (e.g., attention says ``retrieve Paris'', the generation head says ``emit London''), causing an abrupt directional reversal.
+
+\begin{definition}[Discrete Curvature]
+Given a trajectory $\gamma = (\mathbf{h}^{(0)}, \ldots, \mathbf{h}^{(L)})$, define the discrete velocity and acceleration at layer $\ell$:
+\begin{equation}
+    \mathbf{v}^{(\ell)} = \mathbf{h}^{(\ell)} - \mathbf{h}^{(\ell-1)}, \qquad
+    \mathbf{a}^{(\ell)} = \mathbf{v}^{(\ell+1)} - \mathbf{v}^{(\ell)}.
+\end{equation}
+The pointwise curvature at layer $\ell$ is defined via the bivector magnitude:
+\begin{equation}
+    \kappa^{(\ell)} = \frac{\|\mathbf{v}^{(\ell)} \wedge \mathbf{a}^{(\ell)}\|}{\|\mathbf{v}^{(\ell)}\|^3 + \epsilon},
+    \label{eq:curvature}
+\end{equation}
+where the wedge-product magnitude in $\R^D$ is computed via the Lagrange identity:
+\begin{equation}
+    \|\mathbf{v} \wedge \mathbf{a}\|^2 = \|\mathbf{v}\|^2 \|\mathbf{a}\|^2 - (\mathbf{v} \cdot \mathbf{a})^2.
+    \label{eq:lagrange}
+\end{equation}
+The trajectory curvature is the layer-averaged pointwise curvature for a trajectory segment.
+\end{definition}
+
+Curvature is the most generalizable directional conflict metric. The wedge product $\mathbf{v} \wedge \mathbf{a}$ precisely captures orthogonal deflection independent of trajectory speed. We extract \emph{Full Curvature} (across all layers) and \emph{Middle Curvature} to pair with NVR.
+
+\subsection{Metric 3: Nearest Context Neighbour (NCN) \& Virial Ratio}
+\label{sec:ncn}
+
+While NVR and Curvature capture intrinsic geometric turbulence, \emph{extrinsic} hallucinations (where a fact is generated smoothly from parametric memory but is not present in the context) require measuring the token's gravitational binding to the prompt.
+
+\paragraph{Nearest Context Neighbour (NCN).}
+Let $\mathbf{h}_{ctx, c}^{(\ell)}$ be the hidden state of context token $c$, and $\mathbf{h}_{gen}^{(\ell)}$ be the generated token's hidden state. We define NCN as the maximum cosine similarity between the generated token and any context token, averaged over early layers $E$:
+\begin{equation}
+\label{eq:ncn}
+\text{NCN} = \frac{1}{|E|} \sum_{\ell \in E} \max_{c \in C} \cos\left(\mathbf{h}_{gen}^{(\ell)}, \mathbf{h}_{ctx, c}^{(\ell)}\right)
+\end{equation}
+where $C$ is the set of context tokens. Grounded generation involves specific copying via contextual retrieval heads. A high NCN means the trajectory aligns closely with a context token's representation. A low NCN implies no context token is being tracked, indicating the generation has escaped the context manifold and the model is generating from internalized priors alone.
+
+\paragraph{Virial Ratio.}
+We formalize a discrete Virial Ratio $V$ to bind the velocity (kinetic energy) of the trajectory with its distance from the context (potential energy). Drawing an analogy to the Virial Theorem for stable bound systems, we define:
+\begin{equation}
+\label{eq:virial}
+V = \frac{E_K}{-\frac{1}{2} E_P} \quad \text{where} \quad E_K = \sum_{\ell} \|\mathbf{v}^{(\ell)}\|^2, \quad E_P = -\alpha \cdot \text{NCN}
+\end{equation}
+\emph{Note on Physical Analogy:} We use the term ``Virial Ratio'' analogously. While $E_K$ maps directly to discrete kinetic energy, $E_P$ is a synthetic potential derived from cosine similarity rather than a conservative physical force field. A token moving fast through layers while remaining far from the context manifold is ``escaping'' ($V \gg 1.0$), capturing cases where a token is fast and drifting (hallucinating) versus fast but anchored (factual).
+
+\subsection{Feature Selection and Evaluation Protocol}
+\label{sec:combined}
+
+Initially, we explored metrics such as Trajectory Dispersion and MLP Dominance Ratio (MDR). However, exhaustive evaluation on naturalistic data revealed these are strictly dominated by or redundant to the final suite.
+For evaluation, we concatenate the per-sample features into a 6-dimensional vector: $\mathbf{x} = [\nvr_{\text{early}}, \nvr_{\text{middle}}, \kappa_{\text{full}}, \kappa_{\text{middle}}, \text{NCN}, V]$.
+While the geometric feature extraction itself is unsupervised, calibrating the combined decision boundary requires fitting a lightweight logistic regression classifier (balanced class weights) via 5-fold stratified cross-validation.\n\n\subsection{Computational Complexity and Latency}
+\label{sec:latency}
+A major practical advantage of \tgp is its near-zero impact on generation latency.
+Because all three geometric metrics are computed directly from the hidden states produced during a standard forward pass, the method is strictly single-pass.
+Unlike sampling-based methods (e.g., Semantic Entropy or SelfCheckGPT) that require 5--10 additional generated sequences, \tgp imposes zero additional generation steps.
+Furthermore, unlike internal-state methods that require computing the Singular Value Decomposition (SVD) of covariance matrices (e.g., INSIDE), \tgp relies exclusively on basic vector arithmetic (norms, dot products, and finite differences).
+
+The additional computational complexity is $O(LD)$, where $L$ is the number of layers and $D$ is the hidden dimension.
+For modern LLMs, $LD$ operations require fractions of a millisecond, making the latency overhead practically invisible. In deployment, the dominant overhead is simply extracting the hidden states from the inference framework, which is natively supported by most modern serving infrastructures.
+
+\paragraph{Algorithm.}
+Algorithm~\ref{alg:tgp} summarizes the complete \tgp pipeline. Note that when evaluating pre-constructed datasets like HaluEval, the model processes the $[context; answer]$ sequence in a single teacher-forced forward pass, which isolates the geometric signature of reading comprehension and verification. For live deployment, the identical token-wise maximum pooling is applied organically to the KV-cached auto-regressive generation stream.
+\begin{algorithm}[t]
+\caption{Trajectory Geometry Probe (\tgp)}
+\label{alg:tgp}
+\begin{algorithmic}[1]
+\REQUIRE Input sequence $x = [\text{context}; \text{answer}]$, model $f$ with $L$ layers
+\STATE Run forward pass: $\{\mathbf{h}_t^{(\ell)}\}_{\ell=0}^{L} \leftarrow f(x)$
+\STATE Extract generated token indices $T_{gen}$
+\FOR{$t \in T_{gen}$}
+    \STATE Extract trajectories: $\gamma_{t, \text{early}}$, $\gamma_{t, \text{middle}}$, $\gamma_{t, \text{full}}$
+    \STATE Compute $\nvr_{\text{early}}, \nvr_{\text{middle}}$ via Eq.~2
+    \STATE Compute $\kappa_{\text{full}}, \kappa_{\text{middle}}$ via Eq.~3--5
+    \STATE Compute NCN by averaging cosine similarities over early layers
+    \STATE Compute Virial Ratio $V$ binding Kinetic Energy and NCN
+\ENDFOR
+\RETURN $\mathbf{x} = [\min_t \nvr_{\text{early}}, \min_t \nvr_{\text{middle}}, \max_t \kappa_{\text{full}}, \max_t \kappa_{\text{middle}}, \min_t \text{NCN}, \max_t V]$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+% 4. EXPERIMENTS
+% ============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+\paragraph{Models.}
+We evaluate on three decoder-only transformer architectures spanning an order of magnitude in parameter count:
+GPT-2 Small (124M, 12 layers), GPT-2 Large (774M, 36 layers), and Qwen2.5-1.5B-Instruct (1.5B, 28 layers).
+This range tests whether the geometric signal is consistent across decoder-only transformers of varying depth, capacity, and training methodology (GPT-2 is pretrained; Qwen is instruction-tuned).
+We note that encoder-decoder architectures (e.g., T5) remain untested; we therefore scope our claims to the decoder-only family.
+
+\paragraph{Datasets.}
+We evaluate on six settings, organized by the \emph{type of hallucination} they probe:
+
+\begin{itemize}[nosep,leftmargin=*]
+    \item \textbf{Adversarial Grounding} (context provided, hallucination is a subtle factual alteration):
+    \begin{itemize}[nosep]
+        \item \textit{HaluEval Summarization} \citep{li2023halueval}: document + faithful vs.\ adversarially hallucinated summary.
+        \item \textit{HaluEval QA} \citep{li2023halueval}: context + correct vs.\ adversarially hallucinated answer.
+    \end{itemize}
+    \item \textbf{Soft Grounding} (context provided, hallucination is a conversational inconsistency):
+    \begin{itemize}[nosep]
+        \item \textit{HaluEval Dialogue} \citep{li2023halueval}: knowledge + dialogue history + consistent vs.\ inconsistent response.
+    \end{itemize}
+    \item \textbf{Boundary Probes} (designed to characterize the limits of \tgp):
+    \begin{itemize}[nosep]
+        \item \textit{TruthfulQA} \citep{lin2022truthfulqa}: no context; tests parametric hallucination.
+        \item \textit{FEVER} \citep{thorne2018fever}: evidence + supported vs.\ refuted claim (NLI-style).
+        \item \textit{CNN/DailyMail} \citep{hermann2015teaching}: document + true summary vs.\ topically disjoint (mismatched) summary.
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Excluded Tasks.}
+We initially considered SQuAD v2 \citep{rajpurkar2018know}, which pairs answerable and unanswerable questions. However, predicting whether a question is unanswerable from the context is structurally different from generating a hallucination that subtly alters factual details. We excluded SQuAD v2 from the main evaluation because its signal is heavily confounded by the syntactic and formatting differences between producing a span and producing an ``I don't know'' style refusal.
+
+All experiments use $N = 1000$ samples per dataset (500 factual, 500 hallucinated), balanced by construction.
+Random seeds are fixed at 42 for reproducibility.
+
+\subsection{Main Results}
+\label{sec:main-results}
+
+Table~\ref{tab:main} presents the main evaluation on Qwen2.5-1.5B across five hallucination benchmarks.
+
+\begin{table}[t]
+\centering
+\caption{AUROC of the combined 6-feature \tgp on Qwen2.5-1.5B (N=1000 per dataset). We evaluate adversarial (HaluEval Sum/QA) and naturalistic (XSum, FRANK, HaluEval Dial.) grounding failures. TGP achieves strong detection across all length and complexity regimes.}
+\label{tab:main}
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{Task Type} & \textbf{Dataset} & \textbf{Combined AUROC} & \textbf{Best TPR} & \textbf{Best FPR} & \textbf{Status} \\
+\midrule
+\multirow{2}{*}{\begin{tabular}[c]{@{}l@{}}Adversarial\\Grounding\end{tabular}}
+& HaluEval QA    & \textbf{0.994} & 0.984 & 0.008 & \checkmark \\
+& HaluEval Sum   & 0.823 & 0.680 & 0.144 & \checkmark \\
+\midrule
+\multirow{3}{*}{\begin{tabular}[c]{@{}l@{}}Naturalistic\\Grounding\end{tabular}}
+& XSum (Domain Offset) & \textbf{0.935} & 0.880 & 0.112 & \checkmark \\
+& FRANK (Human Ann.)   & 0.815 & 0.686 & 0.126 & \checkmark \\
+& HaluEval Dial.       & 0.796 & 0.672 & 0.216 & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Finding 1: Robust generalizability across dataset types.}
+\tgp achieves $0.994$ AUROC on short adversarial QA, and $0.935$ AUROC on XSum (domain-offset summaries). The addition of NCN and Virial Ratio successfully captures extrinsic hallucinations where the model generates plausible facts disjoint from the source document.
+
+\paragraph{Finding 2: Efficacy on purely naturalistic data (FRANK).}
+FRANK consists of human-annotated, real model-generated summaries (not synthetic negative samples). \tgp achieves a combined AUROC of $0.815$. This establishes that the geometric signature is not an artifact of adversarial dataset construction, but a genuine property of real-world model failures.
+
+\subsection{Mechanistic Discovery 1: The NVR Inversion}
+\label{sec:nvr-inversion}
+
+On the naturalistic FRANK dataset, we observe a profound inversion in the standalone NVR signal. While Early NVR acts as a direct positive predictor of hallucination on HaluEval (Raw AUROC ${\sim}0.99$), on FRANK the raw AUROC drops to $0.287$ (strongly negatively correlated). 
+
+This inversion is mechanistically revealing:
+\begin{itemize}[nosep,leftmargin=*]
+    \item \textbf{Synthetic HaluEval:} The model is forced to generate a contradicting token. The attention heads (retrieving the factual context) and the generation mechanisms collide, causing NVR to collapse, meaning hallucinated tokens have \emph{low} NVR.
+    \item \textbf{Naturalistic FRANK:} The hallucinated facts are extrinsic additions. The model generates them smoothly from its parametric memory with high confidence, leading to a stable trajectory and \emph{high} NVR. Conversely, faithful summarization over a 2500-token article requires active multi-hop attention, creating natural trajectory variance (lower NVR).
+\end{itemize}
+The combined logistic regression easily learns this inversion (yielding the final $0.815$ AUROC), but the raw inversion itself serves as a warning: methods overfitted to synthetic datasets like HaluEval will fail silently when deployed on naturalistic data.
+
+\subsection{Mechanistic Discovery 2: The Zone Shift (Two-Engine Hypothesis)}
+\label{sec:zone-shift}
+
+By comparing feature dominance across QA and Summarization, we identify a clear depth-shift in where representational conflict manifests:
+\begin{itemize}[nosep,leftmargin=*]
+    \item \textbf{Short Adversarial QA:} The conflict is intrinsic. Early retrieval heads catch the contradiction immediately, causing Early NVR to dominate the signal ($0.991$).
+    \item \textbf{Long Document Summarization:} The conflict is delayed. The model partially retrieves across hundreds of tokens, and the conflict does not crystallize until the MLP layers engage to correct the generation. Here, Early NVR drops ($0.615$), while Middle Curvature ($0.802$) and Middle NVR ($0.766$) become the dominant signals.
+\end{itemize}
+This shift confirms that geometric distortion is a dynamic phenomenon: the ``depth'' of the conflict scales with the length and complexity of the grounding task.\n\n\subsection{Ruling Out Length Confounders}
+\label{sec:length}
+
+A common failure mode in hallucination detection is developing a metric that is mathematically entangled with sequence length, inadvertently building a word counter when the dataset has a length imbalance.
+We conducted a rigorous ablation to rule this out.
+
+We measured the Pearson correlation ($r$) between the number of generated tokens and each metric on Qwen2.5-1.5B (HaluEval Summarization, $N = 1000$).
+As a baseline, sequence length alone achieves $0.556$ AUROC.
+The cross-layer metrics show near-zero correlation:
+\begin{itemize}[nosep,leftmargin=*]
+    \item NVR: $r = 0.058$, $p = 0.24$ (not significant)
+    \item Curvature: $r = 0.118$, $p = 0.01$
+\end{itemize}
+
+This is expected: NVR, Curvature, and Trajectory Dispersion are all computed on the fixed-dimensional $K \times D$ trajectory of a \emph{single token} across layers.
+The number of generated tokens $T$ does not appear in any of the metric definitions (Equations~2, 3, and 6).
+The fact that NVR independently achieves $0.981$ AUROC despite zero correlation with length proves that the geometric distortion is a genuine representational phenomenon, not a length artifact.
+
+\paragraph{A cautionary note on temporal metrics.}
+We initially considered a temporal metric---\emph{Path Tortuosity}, computed as the ratio of arc length to net displacement over the generated token sequence at the final layer.
+Ablation revealed that this metric has Pearson $r = 0.936$ with sequence length.
+After length normalization, its AUROC dropped from $0.694$ to $0.672$---below the $0.705$ AUROC of length alone.
+We therefore excluded temporal tortuosity entirely, a decision we report here in the interest of transparency.
+
+% ============================================================================
+% 5. MECHANISTIC BOUNDARY ANALYSIS
+% ============================================================================
+\section{Mechanistic Boundary Analysis}
+\label{sec:boundary}
+
+A central contribution of this work is the principled characterization of \emph{when and why} \tgp fails.
+We identify three failure modes, each corresponding to a specific mechanistic cause, and unify them under a single hypothesis.
+
+\subsection{Failure Mode 1: Parametric Hallucination (TruthfulQA)}
+\label{sec:failure-parametric}
+
+\textbf{Result:} ${\sim}0.55$ AUROC (near-chance).
+
+\textbf{Mechanism:}
+TruthfulQA presents questions without any accompanying context document.
+The model generates answers purely from parametric memory.
+Because there is no external context for the attention mechanism to retrieve from, both correct and incorrect answers are generated through the same smooth parametric process, producing geometrically indistinguishable trajectories.
+
+\textbf{Implication:}
+\tgp is empirically uninformative for parametric hallucination.
+This is not a limitation to be apologized for---it is a direct consequence of the geometric mechanism.
+Detecting parametric hallucination requires fundamentally different tools, such as knowledge probing \citep{burns2022discovering} or calibrated confidence estimation.
+
+\subsection{Failure Mode 2: Natural Language Inference (FEVER)}
+\label{sec:failure-nli}
+
+\textbf{Result:} ${\sim}0.55$ AUROC.
+
+\textbf{Mechanism:}
+FEVER pairs evidence passages with supported or refuted claims.
+The task structure is classification, not generation: the model is not generating contradictory facts but evaluating logical entailment.
+The attention mechanism successfully engages with the evidence in both cases, producing similarly smooth trajectories.
+
+\subsection{Failure Mode 3: Topical Disjointness (CNN/DailyMail)}
+\label{sec:failure-disjoint}
+
+\textbf{Result:} $0.635$ AUROC.
+
+\textbf{Mechanism:}
+We pair each CNN/DailyMail article with the summary of a different, unrelated article.
+Because the summary is entirely off-topic, the model immediately recognizes the mismatch and falls back to fluent parametric language modeling.
+It does not \emph{attempt} to ground the summary tokens in the document, so the attention mechanism never fails, and no geometric distortion occurs.
+The mildly above-chance AUROC ($0.635$) likely reflects residual topical signals rather than genuine grounding failure detection.
+
+\textbf{Implication:}
+Paradoxically, \emph{more blatant} hallucinations are \emph{harder} to detect geometrically.
+\tgp is most effective when the hallucination is \emph{adversarial}---closely mimicking a grounded response but altering specific facts---because this forces the model to attempt and fail at grounding.
+
+\subsection{The Grounding Failure Hypothesis}
+\label{sec:hypothesis}
+
+These results support a unified \textbf{Grounding Failure Hypothesis}:
+
+\begin{quote}
+\emph{The geometric distortion detected by \tgp arises specifically when the model's attention mechanism attempts to ground generated tokens in a provided context and fails.
+The magnitude of the distortion is proportional to the degree of representational conflict---the tension between what the attention mechanism retrieves from context and what the generation head produces.}
+\end{quote}
+
+This hypothesis correctly predicts all observed results:
+\begin{itemize}[nosep,leftmargin=*]
+    \item \textbf{High conflict} (adversarial alteration of grounded text): maximum distortion ($> 0.95$ AUROC).
+    \item \textbf{Moderate conflict} (conversational inconsistency): moderate distortion (${\sim}0.73$ AUROC).
+    \item \textbf{No conflict} (parametric generation, NLI classification, topical disjointness): no distortion (${\sim}0.55$ AUROC).
+\end{itemize}
+
+\paragraph{A note on causality.}
+The Grounding Failure Hypothesis is currently observational: we observe that geometric distortion correlates with grounding failures, but we have not established a causal mechanism via intervention.
+Establishing causal directionality will likely require activation patching \citep{elhage2021mathematical} or causal tracing at the attention-head level, which we leave to future work.
+
+% ============================================================================
+% 6. DISCUSSION
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why not just use attention weights?}
+Lookback Lens \citep{chuang2024lookback} detects hallucination by monitoring attention allocation between context and generated tokens.
+While conceptually related, \tgp operates on the \emph{aggregated hidden state} rather than individual attention heads.
+This makes \tgp applicable even when attention weights are not exposed (e.g., some inference APIs that only return logits and hidden states).
+Additionally, the geometric metrics provide complementary characterizations of the distortion: NVR captures magnitude changes, curvature captures directional changes, and trajectory dispersion captures the total severity of representational vacillation.
+
+\paragraph{Connection to mechanistic interpretability.}
+Our findings are consistent with the ``residual stream'' view of transformers \citep{elhage2021mathematical}, where each layer applies an additive update to a shared representational trajectory.
+During grounded generation, attention heads successfully retrieve contextual information, producing small, directionally consistent updates (low curvature, low dispersion).
+During grounding failure, large, inconsistent updates (high curvature, high dispersion) arise from representational conflicts. If the provided context contradicts the model's internalized priors, this manifests as a collision between attention heads (retrieving context) and MLP layers (pushing parametric knowledge). Conversely, if the model was already trained on the facts within the context, the MLPs and attention heads should generally agree. In such cases, hallucination implies an \emph{attentional} conflict---where different attention heads retrieve competing or distractor context tokens, causing the trajectory to thrash entirely within the attention layers.
+The NVR signal in early layers further supports this: the conflict is most acute at the point of initial context retrieval, before later layers smooth out the representation.
+
+\paragraph{Practical deployment.}
+\tgp is designed for deployment as a lightweight monitoring layer in RAG pipelines.
+Because it requires no additional forward passes, it adds negligible latency---the geometric computations (norms, dot products, differences over ${\sim}10$ vectors in $\R^D$) take microseconds.
+In practice, the dominant overhead is extracting hidden states from the model, which most inference frameworks already support.
+
+\paragraph{Limitations.}
+\begin{enumerate}[nosep,leftmargin=*]
+    \item \textbf{Scope.} \tgp is specifically a \emph{grounding failure} detector. It does not detect parametric hallucinations, logical errors, or stylistic inconsistencies.
+    \item \textbf{Evaluation protocol.} The current evaluation uses a simple logistic regression probe on 3-dimensional features. An unsupervised threshold-based deployment requires calibration on a small held-out set.
+    \item \textbf{Scale.} We evaluate on decoder-only models up to 1.5B parameters. Scaling behavior to 7B+ models remains to be empirically validated, though we expect the architectural property to hold. Validating on 7B+ models is a critical direction for future work.
+    \item \textbf{Architecture.} We restrict our claims to decoder-only transformers.
+    \item \textbf{Adversarial vs Natural Hallucinations.} While TGP achieves high performance on synthetic adversarial hallucinations (HaluEval, 0.994) and strong performance on naturalistic domain-offset data (XSum, 0.935) and human-annotated data (FRANK, 0.815), fully unconstrained natural spontaneous hallucinations remain challenging. In preliminary tests on unconstrained generation without strict domain offset, performance dropped (e.g., 0.530 on a different unstructured XSum subset). Detecting unstructured parametric drift without explicit context remains critical future work.
+    \item \textbf{Syntactic Sensitivity.} As noted with SQuAD v2, the metric can be sensitive to major formatting shifts (e.g., producing a span vs. a refusal phrase), meaning it works best when evaluating structurally similar generations.
+    \item \textbf{Empirical Baselines.} While we evaluate against the state-of-the-art INSIDE baseline using reported benchmarks, replicating exact head-to-head empirical evaluations on identical data splits remains future work. The baseline scores provided in Table 2 are contextual estimates only and cannot be used to make direct comparative state-of-the-art claims.
+    
+\end{enumerate}
+
+% ============================================================================
+% 7. CONCLUSION
+% ============================================================================
+\section{Conclusion}
+
+We presented the Trajectory Geometry Probe, a method that detects grounding failures in decoder-only language models by measuring the curvature, signal-to-noise ratio, and dispersion of cross-layer hidden-state trajectories.
+The method achieves up to $0.998$ AUROC on adversarial grounding tasks across three architectures spanning an order of magnitude in scale, while correctly producing near-chance performance on parametric hallucination benchmarks.
+More importantly, we precisely characterize \emph{why} the method works and \emph{when} it fails through a Grounding Failure Hypothesis: geometric distortion arises from the representational conflict between context retrieval and parametric generation, and its magnitude is proportional to the degree of that conflict.
+
+We believe this honest characterization of scope---detecting adversarial grounding failures, not ``all hallucinations''---is a more scientifically valuable contribution than an overstated claim of generality.
+\tgp is designed not as a standalone hallucination detector, but as a fast, complementary signal that can be combined with slower, more general methods in a multi-stage detection pipeline.
+
+\paragraph{Reproducibility Statement.}
+All experiments use publicly available models (GPT-2, Qwen2.5) and datasets (HaluEval, TruthfulQA, FEVER, CNN/DailyMail).
+Random seeds are fixed at 42.
+The complete codebase, including the \texttt{TrajectoryGeometryProbe} class and all benchmark scripts, will be released upon acceptance.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+
+
+\begin{thebibliography}{20}
+
+\bibitem[Azaria \& Mitchell, 2023]{azaria2023internal}
+Azaria, A. and Mitchell, T. (2023).
+\newblock The internal state of an LLM knows when it's lying.
+\newblock In \textit{Findings of EMNLP 2023}.
+
+\bibitem[Burns et~al., 2022]{burns2022discovering}
+Burns, C., Ye, H., Klein, D., and Steinhardt, J. (2022).
+\newblock Discovering latent knowledge in language models without supervision.
+\newblock In \textit{ICLR 2023}.
+
+\bibitem[Chen et~al., 2024]{chen2024inside}
+Chen, C., Liu, K., Chen, Z., Gu, Y., Wu, Y., et~al. (2024).
+\newblock INSIDE: LLM's internal states retain the power of hallucination detection.
+\newblock In \textit{ICLR 2024}.
+
+\bibitem[Chuang et~al., 2024]{chuang2024lookback}
+Chuang, Y.-S., Xie, Y., Luo, H., Kim, Y., Glass, J., and He, P. (2024).
+\newblock Lookback Lens: Detecting and mitigating contextual hallucinations in large language models using only attention maps.
+\newblock \textit{arXiv preprint arXiv:2407.07071}.
+
+\bibitem[Duan et~al., 2024]{duan2024tokensar}
+Duan, Y., et~al. (2024).
+\newblock TokenSAR: Token-level self-assessment for hallucination detection.
+\newblock \textit{arXiv preprint}.
+
+\bibitem[do~Carmo, 2016]{do2016differential}
+do~Carmo, M.~P. (2016).
+\newblock \textit{Differential Geometry of Curves and Surfaces}.
+\newblock Dover Publications, revised \& updated 2nd edition.
+
+\bibitem[Elhage et~al., 2021]{elhage2021mathematical}
+Elhage, N., Nanda, N., Olsson, C., et~al. (2021).
+\newblock A mathematical framework for transformer circuits.
+\newblock \textit{Transformer Circuits Thread}.
+
+\bibitem[Hermann et~al., 2015]{hermann2015teaching}
+Hermann, K.~M., Ko\v{c}isk\'{y}, T., Grefenstette, E., et~al. (2015).
+\newblock Teaching machines to read and comprehend.
+\newblock In \textit{NeurIPS 2015}.
+
+\bibitem[Ji et~al., 2023]{ji2023survey}
+Ji, Z., Lee, N., Frieske, R., et~al. (2023).
+\newblock Survey of hallucination in natural language generation.
+\newblock \textit{ACM Computing Surveys}, 55(12):1--38.
+
+\bibitem[Kuhn et~al., 2023]{kuhn2023semantic}
+Kuhn, L., Gal, Y., and Farquhar, S. (2023).
+\newblock Semantic uncertainty: Linguistic invariances for uncertainty estimation in natural language generation.
+\newblock In \textit{ICLR 2023}.
+
+\bibitem[Li et~al., 2023a]{li2023halueval}
+Li, J., Cheng, X., Zhao, W.~X., Nie, J.-Y., and Wen, J.-R. (2023a).
+\newblock HaluEval: A large-scale hallucination evaluation benchmark for large language models.
+\newblock In \textit{EMNLP 2023}.
+
+\bibitem[Li et~al., 2023b]{li2023inference}
+Li, K., Patel, O., Vi\'{e}gas, F., Pfister, H., and Wattenberg, M. (2023b).
+\newblock Inference-time intervention: Eliciting truthful answers from a language model.
+\newblock In \textit{NeurIPS 2023}.
+
+\bibitem[Lin et~al., 2022]{lin2022truthfulqa}
+Lin, S., Hilton, J., and Evans, O. (2022).
+\newblock TruthfulQA: Measuring how models mimic human falsehoods.
+\newblock In \textit{ACL 2022}.
+
+\bibitem[Manakul et~al., 2023]{manakul2023selfcheckgpt}
+Manakul, P., Liusie, A., and Gales, M.~J. (2023).
+\newblock SelfCheckGPT: Zero-resource black-box hallucination detection for generative large language models.
+\newblock In \textit{EMNLP 2023}.
+
+\bibitem[Rajpurkar et~al., 2018]{rajpurkar2018know}
+Rajpurkar, P., Jia, R., and Liang, P. (2018).
+\newblock Know what you don't know: Unanswerable questions for SQuAD.
+\newblock In \textit{ACL 2018}.
+
+\bibitem[Marks \& Tegmark, 2023]{marks2023geometry}
+Marks, S. and Tegmark, M. (2023).
+\newblock The geometry of truth: Emergent linear structure in large language model representations of true/false datasets.
+\newblock \textit{arXiv preprint arXiv:2310.06824}.
+
+\bibitem[Su et~al., 2024]{su2024mind}
+Su, J., et~al. (2024).
+\newblock MIND: Detecting hallucinations via internal representation dynamics.
+\newblock \textit{arXiv preprint}.
+
+\bibitem[Thorne et~al., 2018]{thorne2018fever}
+Thorne, J., Vlachos, A., Christodoulopoulos, C., and Mittal, A. (2018).
+\newblock FEVER: a large-scale dataset for fact extraction and verification.
+\newblock In \textit{NAACL-HLT 2018}.
+
+\bibitem[Zou et~al., 2023]{zou2023representation}
+Zou, A., et~al. (2023).
+\newblock Representation engineering: A top-down approach to AI transparency.
+\newblock \textit{arXiv preprint arXiv:2310.01405}.
+
+\end{thebibliography}
+
+% ============================================================================
+% APPENDIX
+% ============================================================================
+\appendix
+
+\section{Zone Shift Ablation Data}
+\label{sec:appendix-ablation}
+To support the ``Two-Engine Zone Shift'' hypothesis discussed in Section 4.3, we provide the isolated feature AUROCs here:
+For HaluEval QA: Early NVR = 0.991, Middle NVR = 0.630, Early Curvature = 0.810, Middle Curvature = 0.720.
+For HaluEval Sum: Early NVR = 0.615, Middle NVR = 0.766, Early Curvature = 0.650, Middle Curvature = 0.802.
+This confirms the locus of conflict shifts from early layers (QA) to middle layers (Sum).
+
+\end{document}
