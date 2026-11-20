@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tgp-probe"
+dynamic = ["version"]
+description = "Trajectory Geometry Probe: fast, training-free groundedness verification from LLM hidden-state geometry"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "nishanthreddyr24-netizen" }]
+keywords = ["hallucination-detection", "rag", "llm", "interpretability", "groundedness"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.110", "uvicorn>=0.29"]
+train = ["scikit-learn>=1.3", "datasets>=2.18", "tqdm>=4.66"]
+dev = ["pytest>=7", "httpx>=0.27", "tokenizers>=0.15", "tgp-probe[server,train]"]
+all = ["tgp-probe[server,train]"]
+
+[project.scripts]
+tgp-probe = "tgp_probe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/nishanthreddyr24-netizen/tgp-probe"
+
+[tool.hatch.version]
+path = "src/tgp_probe/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tgp_probe"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/tgp_probe", "tests", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
