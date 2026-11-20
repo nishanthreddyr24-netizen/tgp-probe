@@ -116,6 +116,21 @@ python examples/custom_cases.py --model Qwen/Qwen2.5-3B-Instruct --calibrator ca
 |---|---|---|---|
 | Qwen2.5-0.5B-Instruct (bundled, trained on CPU) | 0.939 | 0.792 | 0.746 |
 
+### ✅ Successful detections (Qwen2.5-0.5B)
+
+| Case | Response | Score | TGP verdict | Why it worked |
+|---|---|---|---|---|
+| Dose wrong | "Up to 10 g in 24 hours is safe." | **0.730** | 🚩 hallucinated | Dangerous dose that contradicts the 4 g limit in the context |
+| Refund made-up rule | "Yes, gift cards can be returned for store credit within 90 days." | **0.789** | 🚩 hallucinated | Invented policy; NCN dropped to 0.372 |
+| Summary negated | "…and several people were seriously injured." | **0.839** | 🚩 hallucinated | Contradicts "No injuries were reported"; highest curvature (0.285) |
+| Summary off-topic | "The new smartphone features a faster processor…" | **0.741** | 🚩 hallucinated | Unrelated to the flood article; lowest NCN (0.358) |
+| QA correct | "Jeff Bezos" | 0.051 | ✅ grounded | Matches the passage; NCN 0.824 |
+| QA correct year | "1889" | 0.070 | ✅ grounded | Matches the passage |
+| Dose correct | "No more than 4 g in 24 hours." | 0.586 | ✅ grounded | Matches the passage |
+| Dialogue grounded | "Yes, Inception was directed by Christopher Nolan." | 0.572 | ✅ grounded | Matches the knowledge |
+
+Full output, misses included, is below and in [`examples/results/`](examples/results/).
+
 ### Unedited output on the 14 custom cases (Qwen2.5-0.5B, CPU, ~0.2–1 s per case)
 
 Threshold 0.605: a score at or above it is flagged as hallucinated. **8 / 14 correct.**
