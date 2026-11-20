@@ -59,6 +59,14 @@ tgp-probe train --model Qwen/Qwen2.5-3B-Instruct --out calib.json
 
 This downloads HaluEval, extracts features, fits the calibrator, prints held-out AUROC and saves `calib.json`. Skip this step if the package already ships a calibrator for your model (`tgp-probe calibrators`).
 
+**Zero-setup option:** a calibrator for **`Qwen/Qwen2.5-0.5B-Instruct`** is bundled, so this works right after `pip install`, even on CPU:
+
+```python
+probe = TGPProbe.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")   # bundled calibrator loads automatically
+```
+
+It is the smallest evaluator and is good for trying TGP out. For real use, train a calibrator for a 3B+ model (see [Real test cases](#real-test-cases-what-it-actually-does)).
+
 **2. Call it from Python:**
 
 ```python
@@ -92,6 +100,55 @@ r["score"], r["is_hallucination"]
 - Load the probe once at startup and reuse it; loading the model is the slow part, scoring is a single forward pass.
 - Format `context` the way the calibrator was trained: `Question: ...\nPassage: ...` for QA, `Document: ...\nSummary:\n` for summaries. A calibrator fitted on your own data with `probe.fit(...)` works best of all.
 - `r.score` is a probability; `r.is_hallucination` uses the threshold stored in the calibrator. Pick your own cut-off if you need fewer false alarms or fewer misses.
+
+## Real test cases: what it actually does
+
+[`examples/custom_cases.py`](examples/custom_cases.py) runs 14 hand-written cases: QA, a medical-dose and refund-policy RAG scenario, news summaries and dialogue. Each one is either grounded or a specific kind of hallucination (entity swap, number change, negation, made-up rule, off-topic drift). Add your own cases to the `CASES` list.
+
+```bash
+python examples/custom_cases.py                          # bundled Qwen2.5-0.5B calibrator
+python examples/custom_cases.py --model Qwen/Qwen2.5-3B-Instruct --calibrator calib.json
+```
+
+### Calibrator quality (held-out HaluEval, 20% test split)
+
+| Evaluator | HaluEval-QA | HaluEval-Sum | HaluEval-Dialogue |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct (bundled, trained on CPU) | 0.939 | 0.792 | 0.746 |
+
+### Unedited output on the 14 custom cases (Qwen2.5-0.5B, CPU, ~0.2–1 s per case)
+
+Threshold 0.605: a score at or above it is flagged as hallucinated. **8 / 14 correct.**
+
+| Case | Response | Expected | Score | TGP says | | Curv | NCN |
+|---|---|---|---|---|---|---|---|
+| QA correct | Jeff Bezos | grounded | 0.051 | grounded | ✅ | 0.181 | 0.824 |
+| QA wrong person | Elon Musk | hallucinated | 0.045 | grounded | ❌ | 0.191 | **0.369** |
+| QA correct year | 1889 | grounded | 0.070 | grounded | ✅ | 0.189 | 0.651 |
+| QA wrong year | 1925 | hallucinated | 0.070 | grounded | ❌ | 0.189 | 0.651 |
+| QA wrong city | London, England | hallucinated | 0.097 | grounded | ❌ | 0.198 | 0.537 |
+| Dose correct | No more than 4 g in 24 hours. | grounded | 0.586 | grounded | ✅ | 0.261 | 0.470 |
+| Dose wrong | Up to 10 g in 24 hours is safe. | hallucinated | 0.730 | hallucinated | ✅ | 0.273 | 0.410 |
+| Refund correct | You can return unused items within 30 days of delivery. | grounded | 0.650 | hallucinated | ❌ | 0.271 | 0.499 |
+| Refund made-up rule | Yes, gift cards can be returned for store credit within 90 days. | hallucinated | 0.789 | hallucinated | ✅ | 0.281 | 0.372 |
+| Summary faithful | The River Severn flooded over 200 homes in Shrewsbury and about 400 residents were moved to shelters. | grounded | 0.791 | hallucinated | ❌ | 0.278 | 0.458 |
+| Summary negated | …and several people were seriously injured. | hallucinated | 0.839 | hallucinated | ✅ | 0.285 | 0.458 |
+| Summary off-topic | The new smartphone features a faster processor and an improved camera system. | hallucinated | 0.741 | hallucinated | ✅ | 0.274 | **0.358** |
+| Dialogue grounded | Yes, Inception was directed by Christopher Nolan. | grounded | 0.572 | grounded | ✅ | 0.255 | 0.361 |
+| Dialogue wrong | Yes, Inception was directed by Steven Spielberg. | hallucinated | 0.587 | grounded | ❌ | 0.259 | 0.361 |
+
+### What these results show
+
+- **When the same context is compared, the hallucinated version usually scores higher:** dose 0.586 → 0.730, summary 0.791 → 0.839, dialogue 0.572 → 0.587. The raw signals also react as the paper predicts. NCN falls from 0.82 to 0.37 when "Jeff Bezos" becomes "Elon Musk", and the off-topic summary has the lowest NCN of all the summaries.
+- **Absolute scores depend on response length and format.** The 0.5B calibrator relies almost entirely on curvature, and maximum curvature grows with the number of tokens. Short QA answers therefore score low and full sentences score high, whether they are right or not. That is why one shared threshold misclassifies items in both directions.
+- **Answers that share a prefix look identical.** "1889" vs "1925" and "…directed by Nolan" vs "…by Spielberg" get the same features, because TGP keeps only the single most extreme token and that token is in the shared prefix. Only the later tokens differ.
+
+### How to get better results
+
+1. **Use a bigger evaluator.** The paper's 3B and 7B models reach 0.84–0.87 on HaluEval-Sum; 0.5B gets 0.79 here.
+2. **Fit the calibrator on your own task and format** with `probe.fit(contexts, responses, labels)`. Even 100–200 labelled examples from your real traffic remove most of the length and format bias.
+3. **Score short units:** one sentence or claim at a time instead of whole paragraphs.
+4. **Look at per-token traces** with `return_tokens=True` to see which words caused a flag.
 
 ## Probe physics
 
@@ -183,6 +240,7 @@ Wider evaluators handle long-context summarization better. Teacher-forced NLL, b
 ```
 src/tgp_probe/      installable package (features, calibrator, probe, CLI, server)
 tests/              offline test suite (tiny in-memory model, no downloads)
+examples/           custom_cases.py: hand-written real-world test cases
 experiments/        original research scripts (v2 multi-zone, v3 zone ablation)
 paper.tex           paper source
 ```

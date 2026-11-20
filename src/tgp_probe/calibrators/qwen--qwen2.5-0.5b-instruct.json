@@ -1,0 +1,44 @@
+{
+  "format_version": 1,
+  "feature_names": [
+    "Full_Curv",
+    "Middle_Curv",
+    "NCN"
+  ],
+  "mean": [
+    0.24542861408243577,
+    0.22661773838102817,
+    0.47911015935242174
+  ],
+  "scale": [
+    0.03527352946533904,
+    0.02027646624782264,
+    0.1690762398632336
+  ],
+  "coef": [
+    1.7413850396020134,
+    -0.17750622668879829,
+    0.11563546084684417
+  ],
+  "intercept": -0.19310729945451377,
+  "threshold": 0.6046425624246805,
+  "metadata": {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "dtype": "torch.float32",
+    "feature_set": "paper",
+    "datasets": [
+      "halueval_qa",
+      "halueval_summarization",
+      "halueval_dialogue"
+    ],
+    "n_per_dataset": 500,
+    "max_context_tokens": 2500,
+    "max_response_tokens": 150,
+    "n_train": 1200,
+    "test_auroc": {
+      "halueval_qa": 0.9392,
+      "halueval_summarization": 0.7924,
+      "halueval_dialogue": 0.746
+    }
+  }
+}

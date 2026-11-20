@@ -45,4 +45,4 @@ def test_cli_parser_and_calibrators(capsys):
     args = build_parser().parse_args(["train", "--out", "x.json"])
     assert args.calibrator == "none" and args.features == "paper"
     assert main(["calibrators"]) == 0
-    assert "no bundled" in capsys.readouterr().out
+    assert "qwen--qwen2.5-0.5b-instruct" in capsys.readouterr().out
